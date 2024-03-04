@@ -2,7 +2,6 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include "streets.h"
 
 // use for reading from file and stdin
@@ -16,13 +15,14 @@ char buffer[BUFSIZE];
 static bool
 load_int_array(int size, int arr[size], FILE * f)
 {
+    int ret;
     for (int i = 0; i < size; i++) {
         if (fscanf(f, "%d", arr+i) != 1) {
             return false;
         }
     }
-    fscanf(f, "\n");
-    return true;
+    ret = fscanf(f, "\n");
+    return ret == 0;
 }
 
 static void
@@ -37,7 +37,7 @@ remove_newline(char * string)
 static struct ssmap * 
 load_map(const char * filename)
 {
-    FILE * f = fopen(filename, "rt");
+    FILE * f = fopen(filename, "r");
     struct ssmap * map = NULL;
     int nr_nodes, nr_ways;
 
@@ -56,7 +56,7 @@ load_map(const char * filename)
 
     map = ssmap_create(nr_nodes, nr_ways);
     if (map == NULL) {
-        fprintf(stderr, "error: could not create ssmap\n");
+        fprintf(stderr, "error: ssmap_create(%d ,%d) failed\n", nr_nodes, nr_ways);
         goto done;
     }
 
@@ -66,9 +66,9 @@ load_map(const char * filename)
         char which_way[8];
 
         /* note: we are intentionally not loading the OSM id */
-        RET_OK(fscanf(f, "way %d %*d ", &id), 1, cleanup);
-        RET_OK(fgets(buffer, BUFSIZE, f), buffer, cleanup);
-        RET_OK(fscanf(f, " %f %7s %d\n", &maxspeed, which_way, &num_nodes), 3, cleanup);
+        RET_OK(fscanf(f, "way %d %*d ", &id), 1, invalid);
+        RET_OK(fgets(buffer, BUFSIZE, f), buffer, invalid);
+        RET_OK(fscanf(f, " %f %7s %d\n", &maxspeed, which_way, &num_nodes), 3, invalid);
 
         remove_newline(buffer);
         bool oneway = strcmp(which_way, "oneway") == 0;
@@ -76,11 +76,16 @@ load_map(const char * filename)
 
         if (num_nodes > 0) {
             int node_ids[num_nodes];
-            RET_OK(load_int_array(num_nodes, node_ids, f), true, cleanup);
+            RET_OK(load_int_array(num_nodes, node_ids, f), true, invalid);
             way = ssmap_add_way(map, id, buffer, maxspeed, oneway, num_nodes, node_ids);
+        }
+        else {
+            fprintf(stderr, "error: way %d has no associated node(s)\n", id);
+            goto cleanup;
         }
 
         if (way == NULL) {
+            fprintf(stderr, "error: ssmap_add_way(%d) failed\n", id);
             goto cleanup;
         }
     }
@@ -90,31 +95,40 @@ load_map(const char * filename)
         double lat, lon;
 
         /* note: we are intentionally not loading the OSM id */
-        RET_OK(fscanf(f, "node %d %*d %lf %lf %d\n", &id, &lat, &lon, &num_ways), 4, cleanup);
+        RET_OK(fscanf(f, "node %d %*d %lf %lf %d\n", &id, &lat, &lon, &num_ways), 4, invalid);
         struct node * node = NULL;
         
         if (num_ways > 0) {
             int way_ids[num_ways];
-            RET_OK(load_int_array(num_ways, way_ids, f), true, cleanup);
+            RET_OK(load_int_array(num_ways, way_ids, f), true, invalid);
             node = ssmap_add_node(map, id, lat, lon, num_ways, way_ids);
+        }
+        else {
+            fprintf(stderr, "error: node %d has no associated way(s)\n", id);
+            goto cleanup;
         }
          
         if (node == NULL) {
+            fprintf(stderr, "error: ssmap_add_node(%d) failed\n", id);
             goto cleanup;
         }
     }
 
     // custom initialization after all nodes and ways have been added
     if (!ssmap_initialize(map)) {
+        fprintf(stderr, "error: ssmap_initialize() failed\n");
         goto cleanup;
     }
 
     printf("%s successfully loaded. %d nodes, %d ways.\n", filename, nr_nodes, nr_ways);
     goto done;
-cleanup:
-    ssmap_destroy(map);
 invalid:
     fprintf(stderr, "error: %s has invalid file format\n", filename);
+cleanup:
+    if (map != NULL) {
+        ssmap_destroy(map);
+        map = NULL;
+    }
 done:
     fclose(f);
     return map;
@@ -123,14 +137,34 @@ done:
 static bool
 get_integer_argument(char * line, int * iptr)
 {
+    char * endptr;
     remove_newline(line);
 
-    if (sscanf(line, "%d", iptr) == 1) {
-        return true;
+    *iptr = strtol(line, &endptr, 10);
+    if (endptr && *endptr != '\0') {
+        printf("error: '%s' is not an integer.\n", line);
+        return false;
     }
 
-    printf("error: '%s' is not an integer.\n", line);
-    return false;
+    return true;
+}
+
+static void
+handle_print(char * line, struct ssmap * map, void (* print)(const struct ssmap *, int))
+{
+    char * first = strtok_r(line, " \t\r\n\v\f", &line);
+    char * second = strtok_r(line, " \t\r\n\v\f", &line);
+    int id;
+
+    if (first == NULL || second != NULL) {
+        printf("error: invalid number of arguments.\n");
+    }
+    else if (get_integer_argument(first, &id)) {
+        print(map, id);
+        return;
+    }
+
+    printf("usage: node|way id\n");
 }
 
 static void
@@ -170,7 +204,8 @@ handle_find(char * line, struct ssmap * map)
 }
 
 static bool
-handle_path_travel_time(char * line, struct ssmap * map)
+handle_path_time(char * line, struct ssmap * map, 
+    double (* time_function)(const struct ssmap *, int, int *))
 {
     int capacity = 1;
     int n = 0;
@@ -185,14 +220,11 @@ handle_path_travel_time(char * line, struct ssmap * map)
     int node_ids[capacity];
     while(true) {
         char * token = strtok_r(line, " \t\r\n\v\f", &line);
-        char * endptr;
 
         if (token == NULL)
             break;
 
-        node_ids[n++] = strtol(token, &endptr, 10);
-        if (endptr && *endptr != '\0') {
-            printf("error: %s is not an integer.\n", token);
+        if (!get_integer_argument(token, &node_ids[n++])) {
             return false;
         }
     }
@@ -202,7 +234,7 @@ handle_path_travel_time(char * line, struct ssmap * map)
         return false;
     }
 
-    double result = ssmap_path_travel_time(map, n, node_ids);
+    double result = time_function(map, n, node_ids);
     if (result >= 0.) {
         printf("%.4f minutes\n", result);
     }
@@ -215,22 +247,20 @@ handle_path_create(char * line, struct ssmap * map)
 {
     char * start = strtok_r(line, " \t\r\n\v\f", &line);
     char * finish = strtok_r(line, " \t\r\n\v\f", &line);
-    char * endptr;
+    char * third = strtok_r(line, " \t\r\n\v\f", &line);
+    int start_id, end_id;
 
     if (start == NULL || finish == NULL) {
         printf("error: must specify start node and finish node.\n");
         return false;
     }
-
-    int start_id = strtol(start, &endptr, 10);
-    if (endptr && *endptr != '\0') {
-        printf("error: %s is not an integer.\n", start);
+    else if (third != NULL) {
+        printf("error: too many arguments.\n");
         return false;
     }
 
-    int end_id = strtol(finish, &endptr, 10);
-    if (endptr && *endptr != '\0') {
-        printf("error: %s is not an integer.\n", finish);
+    if (!get_integer_argument(start, &start_id) || 
+        !get_integer_argument(finish, &end_id)) {
         return false;
     }
 
@@ -247,7 +277,7 @@ handle_path(char * line, struct ssmap * map)
         /* fall through */
     }
     else if (strcmp(command, "time") == 0) {
-        if (handle_path_travel_time(line, map))
+        if (handle_path_time(line, map, ssmap_path_travel_time))
             return;
     }
     else if (strcmp(command, "create") == 0) {
@@ -291,16 +321,10 @@ main(int argc, const char * argv[])
             break;
         }
         else if (strcmp(command, "node") == 0) {
-            int id;
-            if (get_integer_argument(ptr, &id)) {
-                ssmap_print_node(map, id);
-            }
+            handle_print(ptr, map, ssmap_print_node);
         }
         else if (strcmp(command, "way") == 0) {
-            int id;
-            if (get_integer_argument(ptr, &id)) {
-                ssmap_print_way(map, id);
-            }
+            handle_print(ptr, map, ssmap_print_way);
         }
         else if (strcmp(command, "find") == 0) {
             handle_find(ptr, map);

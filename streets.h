@@ -1,6 +1,8 @@
 #ifndef _STREETS_H_
 #define _STREETS_H_
 
+#include <stdbool.h>
+
 /**
  * Valid node or way IDs start from 0, so we use -1 to denote invalid ID.
  */
@@ -9,7 +11,6 @@
 struct ssmap;
 struct node;
 struct way;
-struct path;
 
 /**
  * Create a new ssmap data structure.
